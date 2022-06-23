@@ -4,10 +4,13 @@ use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::{Layouter, SimpleFloorPlanner},
     dev::MockProver,
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector, create_proof, verify_proof, keygen_pk, keygen_vk, SingleVerifier},
     poly::Rotation,
+    poly::commitment::{Params, ParamsVerifier},
+    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
 };
-use pairing::bn256::Fr as Fp;
+use pairing::bn256::{Bn256, Fr as Fp, G1Affine};
+use rand_core::OsRng;
 
 #[test]
 fn lookup_any() {
@@ -237,6 +240,8 @@ fn lookup_any() {
       vec!(Fp::from(1), Fp::from(1), Fp::from(0)),
     ]);
 
+    let public_input_size = xor_witnesses_table[0].len();
+
     // Given the correct public input, our circuit will verify.
     let prover = MockProver::run(k, &circuit, xor_witnesses_table).unwrap();
     assert_eq!(prover.verify(), Ok(()));
@@ -245,5 +250,40 @@ fn lookup_any() {
     // // the odd number lookup will fail.
     let wrong_xor_witnesses = vec![vec![Fp::from(1)], vec![Fp::from(1)], vec![Fp::from(1)]];
     let prover = MockProver::run(k, &circuit, wrong_xor_witnesses).unwrap();
-    assert!(prover.verify().is_err())
+    assert!(prover.verify().is_err());
+
+    let params: Params<G1Affine> = Params::<G1Affine>::unsafe_setup::<Bn256>(k);
+    let params_verifier: ParamsVerifier<Bn256> = params.verifier(public_input_size).unwrap();
+
+    // Initialize the proving key
+    let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+    let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk should not fail");
+
+    let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+
+    let mut instance_table = transpose2(vec![
+      vec!(Fp::from(0), Fp::from(0), Fp::from(0)),
+      vec!(Fp::from(0), Fp::from(1), Fp::from(1)),
+      vec!(Fp::from(1), Fp::from(0), Fp::from(1)),
+      vec!(Fp::from(1), Fp::from(1), Fp::from(0)),
+    ]);
+
+    let instance: Vec<&[Fp]> = instance_table.iter_mut().map(|vfp| vfp.as_slice()).collect();
+    let instances = [instance.as_slice()];
+
+    create_proof(&params, &pk, &[circuit], &instances, OsRng, &mut transcript)
+    .expect("proof generation should not fail");
+    let proof = transcript.finalize();
+    print!("{:02X?}", proof);
+
+    let strategy = SingleVerifier::new(&params_verifier);
+    let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+    verify_proof(
+      &params_verifier,
+      pk.get_vk(),
+      strategy,
+      &instances,
+      &mut transcript,
+    )
+    .unwrap();
 }
